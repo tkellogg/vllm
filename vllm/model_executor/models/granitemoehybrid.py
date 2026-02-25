@@ -399,7 +399,8 @@ class GraniteMoeHybridModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states = self.norm(hidden_states)
+        if not getattr(self.config, "sae_skip_final_norm", False):
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -439,6 +440,18 @@ class GraniteMoeHybridModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
+        max_layer_idx = len(self.layers) - 1
+
+        def _is_missing_layer_weight(name: str) -> bool:
+            if not name.startswith("layers."):
+                return False
+            parts = name.split(".", 2)
+            if len(parts) < 2:
+                return False
+            layer_str = parts[1]
+            if not layer_str.isdigit():
+                return False
+            return int(layer_str) > max_layer_idx
 
         def _load(n, p):
             param = params_dict[n]
@@ -492,6 +505,8 @@ class GraniteMoeHybridModel(nn.Module):
             return None
 
         for n, p in weights:
+            if _is_missing_layer_weight(n):
+                continue
             if "A_log" in n:
                 n = n.replace("A_log", "A")
 

@@ -256,6 +256,8 @@ class ModelConfig:
     """Optional regex pattern specifying valid logits processor qualified names
     that can be passed with the `logits_processors` extra completion argument.
     Defaults to `None`, which allows no processors."""
+    sae_max_layer: int | None = None
+    """Optional max layer index (0-based) to truncate the model for SAE runs."""
     generation_config: str = "auto"
     """The folder path to the generation config. Defaults to `"auto"`, the
     generation config will be loaded from model path. If set to `"vllm"`, no
@@ -487,6 +489,21 @@ class ModelConfig:
         if dict_overrides:
             self._apply_dict_overrides(hf_config, dict_overrides)
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        if self.sae_max_layer is not None:
+            if self.sae_max_layer < 0:
+                raise ValueError("sae_max_layer must be >= 0")
+            keep_layers = int(self.sae_max_layer) + 1
+            hf_config.num_hidden_layers = keep_layers
+            hf_text_config = getattr(hf_config, "text_config", None)
+            if hf_text_config is not None and hasattr(hf_text_config, "num_hidden_layers"):
+                hf_text_config.num_hidden_layers = keep_layers
+            layer_types = getattr(hf_config, "layer_types", None)
+            if layer_types is not None:
+                hf_config.layer_types = layer_types[:keep_layers]
+            if hf_text_config is not None:
+                text_layer_types = getattr(hf_text_config, "layer_types", None)
+                if text_layer_types is not None:
+                    hf_text_config.layer_types = text_layer_types[:keep_layers]
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )

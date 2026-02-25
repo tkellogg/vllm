@@ -575,6 +575,7 @@ class EngineArgs:
         ModelConfig.logits_processors
     )
     """Custom logitproc types"""
+    sae_max_layer: int | None = ModelConfig.sae_max_layer
 
     async_scheduling: bool | None = SchedulerConfig.async_scheduling
 
@@ -1314,6 +1315,7 @@ class EngineArgs:
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,
             io_processor_plugin=self.io_processor_plugin,
+            sae_max_layer=self.sae_max_layer,
         )
 
     def validate_tensorizer_args(self):
