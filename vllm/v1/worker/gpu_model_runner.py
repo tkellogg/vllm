@@ -193,6 +193,8 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
+_TRACE_MODEL = os.environ.get("VLLM_TRACE_MODEL") == "1"
+_TRACE_MODEL_MIN_TOKENS = int(os.environ.get("VLLM_TRACE_MODEL_MIN_TOKENS", "0"))
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -3333,12 +3335,15 @@ class GPUModelRunner(
             )
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        trace = _TRACE_MODEL and num_scheduled_tokens >= _TRACE_MODEL_MIN_TOKENS
+        t_start = time.monotonic() if trace else 0.0
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+            t_after_update = time.monotonic() if trace else 0.0
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -3384,6 +3389,7 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            t_after_prepare = time.monotonic() if trace else 0.0
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -3409,6 +3415,7 @@ class GPUModelRunner(
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
+            t_after_padding = time.monotonic() if trace else 0.0
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -3491,6 +3498,7 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            t_after_attn = time.monotonic() if trace else 0.0
 
             (
                 input_ids,
@@ -3541,6 +3549,22 @@ class GPUModelRunner(
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
+            )
+        t_after_forward = time.monotonic() if trace else 0.0
+
+        if trace:
+            total_ms = (t_after_forward - t_start) * 1000.0
+            logger.info(
+                "execute_model: tokens=%s reqs=%s update=%.2fms prep=%.2fms "
+                "pad=%.2fms attn=%.2fms forward=%.2fms total=%.2fms",
+                num_scheduled_tokens,
+                num_reqs,
+                (t_after_update - t_start) * 1000.0,
+                (t_after_prepare - t_after_update) * 1000.0,
+                (t_after_padding - t_after_prepare) * 1000.0,
+                (t_after_attn - t_after_padding) * 1000.0,
+                (t_after_forward - t_after_attn) * 1000.0,
+                total_ms,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):

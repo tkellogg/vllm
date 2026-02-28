@@ -69,6 +69,8 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+_TRACE_ENGINE = os.environ.get("VLLM_TRACE_ENGINE") == "1"
+_TRACE_ENGINE_MIN_MS = float(os.environ.get("VLLM_TRACE_ENGINE_MIN_MS", "0"))
 
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -401,8 +403,12 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        trace = _TRACE_ENGINE
+        t_start = time.monotonic() if trace else 0.0
         scheduler_output = self.scheduler.schedule()
+        t_after_schedule = time.monotonic() if trace else 0.0
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        t_after_submit = time.monotonic() if trace else 0.0
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
@@ -411,6 +417,7 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        t_after_model = time.monotonic() if trace else 0.0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -418,6 +425,22 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        t_after_update = time.monotonic() if trace else 0.0
+
+        if trace:
+            total_ms = (t_after_update - t_start) * 1000.0
+            if total_ms >= _TRACE_ENGINE_MIN_MS:
+                logger.info(
+                    "engine_step: tokens=%s reqs=%s schedule=%.2fms submit=%.2fms "
+                    "model=%.2fms update=%.2fms total=%.2fms",
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(scheduler_output.num_scheduled_tokens),
+                    (t_after_schedule - t_start) * 1000.0,
+                    (t_after_submit - t_after_schedule) * 1000.0,
+                    (t_after_model - t_after_submit) * 1000.0,
+                    (t_after_update - t_after_model) * 1000.0,
+                    total_ms,
+                )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 

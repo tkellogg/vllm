@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, overload
 
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
+from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import AsyncMicrobatchTokenizer
 
@@ -25,6 +28,11 @@ if TYPE_CHECKING:
         ChatCompletionMessageParam,
         ConversationMessage,
     )
+
+logger = init_logger(__name__)
+_TRACE_TOKENIZE = os.environ.get("VLLM_TRACE_TOKENIZE") == "1"
+_TRACE_DETOKENIZE = os.environ.get("VLLM_TRACE_DETOKENIZE") == "1"
+_TRACE_RENDER = os.environ.get("VLLM_TRACE_RENDER") == "1"
 
 
 class BaseRenderer(ABC):
@@ -111,10 +119,23 @@ class BaseRenderer(ABC):
         params: TokenizeParams,
     ) -> TokensPrompt:
         tokenizer = self.get_tokenizer()
-        prompt_token_ids = tokenizer.encode(
-            prompt["prompt"],
-            **params.get_encode_kwargs(),
-        )
+        if _TRACE_TOKENIZE:
+            start = time.monotonic()
+            prompt_token_ids = tokenizer.encode(
+                prompt["prompt"],
+                **params.get_encode_kwargs(),
+            )
+            logger.info(
+                "tokenize_prompt: chars=%s tokens=%s in %.2fs",
+                len(prompt["prompt"]),
+                len(prompt_token_ids),
+                time.monotonic() - start,
+            )
+        else:
+            prompt_token_ids = tokenizer.encode(
+                prompt["prompt"],
+                **params.get_encode_kwargs(),
+            )
 
         return TokensPrompt(prompt_token_ids=prompt_token_ids, **prompt)
 
@@ -133,7 +154,18 @@ class BaseRenderer(ABC):
 
     def _detokenize_prompt(self, prompt: TokensPrompt) -> TokensPrompt:
         tokenizer = self.get_tokenizer()
-        prompt["prompt"] = tokenizer.decode(prompt["prompt_token_ids"])
+        if _TRACE_DETOKENIZE:
+            start = time.monotonic()
+            text = tokenizer.decode(prompt["prompt_token_ids"])
+            logger.info(
+                "detokenize_prompt: tokens=%s chars=%s in %.2fs",
+                len(prompt["prompt_token_ids"]),
+                len(text),
+                time.monotonic() - start,
+            )
+            prompt["prompt"] = text
+        else:
+            prompt["prompt"] = tokenizer.decode(prompt["prompt_token_ids"])
 
         return prompt
 
@@ -300,7 +332,12 @@ class BaseRenderer(ABC):
         *,
         prompt_extras: dict[str, Any] | None = None,
     ):
-        dict_prompts = self.render_prompts(prompts)
+        if _TRACE_RENDER:
+            start = time.monotonic()
+            dict_prompts = self.render_prompts(prompts)
+            logger.info("render_cmpl: render_prompts in %.2fs", time.monotonic() - start)
+        else:
+            dict_prompts = self.render_prompts(prompts)
 
         # NOTE: Some MM models have non-default `add_special_tokens`
         # so we handle tokenization in multi-modal processor
@@ -308,7 +345,15 @@ class BaseRenderer(ABC):
             self._apply_prompt_extras(dict_prompts, prompt_extras)
             return dict_prompts
 
-        tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
+        if _TRACE_RENDER:
+            tok_start = time.monotonic()
+            tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
+            logger.info(
+                "render_cmpl: tokenize_prompts in %.2fs",
+                time.monotonic() - tok_start,
+            )
+        else:
+            tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
 
