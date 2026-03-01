@@ -139,7 +139,7 @@ class EngineCoreOutput(
     new_logprobs: LogprobsLists | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
 
-    pooling_output: torch.Tensor | dict[str, np.ndarray] | None = None
+    pooling_output: Any = None
 
     finish_reason: FinishReason | None = None
     stop_reason: int | str | None = None
