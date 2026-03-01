@@ -197,6 +197,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 _TRACE_MODEL = os.environ.get("VLLM_TRACE_MODEL") == "1"
 _TRACE_MODEL_MIN_TOKENS = int(os.environ.get("VLLM_TRACE_MODEL_MIN_TOKENS", "0"))
+_TRACE_SAE = os.environ.get("VLLM_SAE_TRACE") == "1"
+_TRACE_SAE_EVERY = int(os.environ.get("VLLM_SAE_TRACE_EVERY", "20"))
+_TRACE_SAE_MIN_MS = float(os.environ.get("VLLM_SAE_TRACE_MIN_MS", "1000"))
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -2723,37 +2726,97 @@ class GPUModelRunner(
 
         threshold = float(self._sae_value_threshold)
         block_tokens = self._sae_block_tokens
+        total_blocks = (total_tokens + block_tokens - 1) // block_tokens
+        total_rows = 0
+        start_total = time.monotonic()
+        if _TRACE_SAE:
+            logger.info(
+                "SAE encode start: tokens=%s blocks=%s d_sae=%s threshold=%.6g",
+                total_tokens,
+                total_blocks,
+                d_sae,
+                threshold,
+            )
         with torch.inference_mode():
-            for start in range(0, total_tokens, block_tokens):
+            for block_idx, start in enumerate(
+                range(0, total_tokens, block_tokens), start=1
+            ):
+                t0 = time.monotonic()
                 end = min(start + block_tokens, total_tokens)
                 block = token_embeddings[start:end].to(
                     device=self.device, dtype=self._sae.encoder_weight.dtype
                 )
                 encoded = self._sae.encode(block)
+                t1 = time.monotonic()
                 if threshold > 0:
                     mask = encoded > threshold
                 else:
                     mask = encoded > 0
                 nz = torch.nonzero(mask, as_tuple=False)
+                t2 = time.monotonic()
                 if nz.numel() == 0:
+                    if _TRACE_SAE and block_idx % _TRACE_SAE_EVERY == 0:
+                        logger.info(
+                            "SAE block %s/%s: rows=0 encode=%.1fms nz=%.1fms total=%.1fms",
+                            block_idx,
+                            total_blocks,
+                            (t1 - t0) * 1000.0,
+                            (t2 - t1) * 1000.0,
+                            (t2 - t0) * 1000.0,
+                        )
                     continue
                 token_idx = (nz[:, 0] + start).to(torch.int32)
                 feat_idx = nz[:, 1].to(torch.int32)
                 values = encoded[nz[:, 0], nz[:, 1]].to(torch.float16)
+                t3 = time.monotonic()
                 token_idx_parts.append(token_idx.cpu().numpy())
                 feat_idx_parts.append(
                     feat_idx.cpu().numpy().astype(feat_dtype, copy=False)
                 )
                 value_parts.append(values.cpu().numpy())
+                t4 = time.monotonic()
+                rows = int(values.shape[0])
+                total_rows += rows
+                block_ms = (t4 - t0) * 1000.0
+                if _TRACE_SAE and (
+                    block_idx % _TRACE_SAE_EVERY == 0
+                    or block_ms >= _TRACE_SAE_MIN_MS
+                ):
+                    logger.info(
+                        "SAE block %s/%s: rows=%s encode=%.1fms nz=%.1fms gather=%.1fms cpu=%.1fms total=%.1fms (rows_total=%s)",
+                        block_idx,
+                        total_blocks,
+                        rows,
+                        (t1 - t0) * 1000.0,
+                        (t2 - t1) * 1000.0,
+                        (t3 - t2) * 1000.0,
+                        (t4 - t3) * 1000.0,
+                        block_ms,
+                        total_rows,
+                    )
 
         if token_idx_parts:
+            t_concat_start = time.monotonic()
             token_idx_arr = np.concatenate(token_idx_parts)
             feat_idx_arr = np.concatenate(feat_idx_parts)
             values_arr = np.concatenate(value_parts)
+            if _TRACE_SAE:
+                logger.info(
+                    "SAE concat: rows=%s in %.2fs",
+                    int(values_arr.shape[0]),
+                    time.monotonic() - t_concat_start,
+                )
         else:
             token_idx_arr = np.empty((0,), dtype=np.int32)
             feat_idx_arr = np.empty((0,), dtype=feat_dtype)
             values_arr = np.empty((0,), dtype=np.float16)
+
+        if _TRACE_SAE:
+            logger.info(
+                "SAE encode done: rows=%s total_time=%.2fs",
+                int(values_arr.shape[0]),
+                time.monotonic() - start_total,
+            )
 
         return {
             "token_index": token_idx_arr,
@@ -2786,6 +2849,11 @@ class GPUModelRunner(
         raw_pooler_output: PoolerOutput = model.pooler(
             hidden_states=hidden_states, pooling_metadata=pooling_metadata
         )
+        if _TRACE_SAE and self._should_apply_sae(pooling_metadata):
+            logger.info(
+                "SAE pooler output ready: type=%s",
+                type(raw_pooler_output).__name__,
+            )
 
         finished_mask = [
             seq_len == prompt_len
