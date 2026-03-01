@@ -72,15 +72,17 @@ class PoolingOutput:
         data: The extracted hidden states.
     """
 
-    data: torch.Tensor
+    data: Any
 
     def __repr__(self) -> str:
         return f"PoolingOutput(data={self.data})"
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, self.__class__) and bool(
-            (self.data == other.data).all()
-        )
+        if not isinstance(other, self.__class__):
+            return False
+        if isinstance(self.data, torch.Tensor) and isinstance(other.data, torch.Tensor):
+            return bool((self.data == other.data).all())
+        return self.data == other.data
 
 
 class RequestOutput:

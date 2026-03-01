@@ -407,7 +407,7 @@ class RequestState:
             stop_reason=stop_reason if finished else None,
         )
 
-    def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
+    def _new_pooling_output(self, pooling_output: Any) -> PoolingOutput:
         return PoolingOutput(data=pooling_output)
 
 

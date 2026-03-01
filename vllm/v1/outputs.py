@@ -107,7 +107,13 @@ class LogprobsTensors(NamedTuple):
 
 # [num_reqs, <dynamic>]
 # The shape of each element depends on the pooler used
-PoolerOutput: TypeAlias = torch.Tensor | list[torch.Tensor] | list[torch.Tensor | None]
+PoolerOutput: TypeAlias = (
+    torch.Tensor
+    | dict[str, np.ndarray]
+    | list[torch.Tensor]
+    | list[torch.Tensor | None]
+    | list[dict[str, np.ndarray] | None]
+)
 
 
 @dataclass
@@ -183,7 +189,7 @@ class ModelRunnerOutput:
     )
 
     # [num_reqs, hidden_size]
-    pooler_output: list[torch.Tensor | None] | None = None
+    pooler_output: list[torch.Tensor | dict[str, np.ndarray] | None] | None = None
 
     kv_connector_output: KVConnectorOutput | None = None
 

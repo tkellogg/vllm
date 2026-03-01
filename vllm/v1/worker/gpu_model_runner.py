@@ -190,6 +190,7 @@ from .utils import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.sae.sparse_encoder import SparseSAE
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -416,6 +417,19 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+
+        self._sae_enabled = (
+            os.environ.get("VLLM_SAE_ENABLE") == "1"
+            or bool(os.environ.get("VLLM_SAE_SUBDIR", "").strip())
+        )
+        self._sae: "SparseSAE | None" = None
+        self._sae_layer: int | None = None
+        self._sae_block_tokens = max(
+            1, int(os.environ.get("VLLM_SAE_BLOCK_TOKENS", "512"))
+        )
+        self._sae_value_threshold = float(
+            os.environ.get("VLLM_SAE_VALUE_THRESHOLD", "0")
+        )
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -2656,6 +2670,98 @@ class GPUModelRunner(
             log_stats=self.parallel_config.eplb_config.log_balancedness,
         )
 
+    def _should_apply_sae(self, pooling_metadata: PoolingMetadata) -> bool:
+        if not self._sae_enabled:
+            return False
+        tasks = getattr(pooling_metadata, "tasks", None)
+        if not tasks:
+            return False
+        return all(task == "token_embed" for task in tasks)
+
+    def _ensure_sae_loaded(self) -> None:
+        if not self._sae_enabled or self._sae is not None:
+            return
+        try:
+            from vllm.sae.sparse_encoder import load_sae_from_env
+
+            sae, layer = load_sae_from_env()
+        except Exception as exc:
+            logger.exception("Failed to load SAE weights: %s", exc)
+            raise
+
+        max_layer = self.model_config.sae_max_layer
+        if max_layer is not None and int(max_layer) != int(layer):
+            raise ValueError(
+                "sae_max_layer mismatch: model_config=%s, SAE=%s"
+                % (max_layer, layer)
+            )
+
+        self._sae = sae.to(device=self.device, dtype=self.model_config.dtype)
+        self._sae_layer = int(layer)
+        logger.info(
+            "Loaded SAE weights (layer=%s, block_tokens=%s).",
+            self._sae_layer,
+            self._sae_block_tokens,
+        )
+
+    def _encode_sae_sparse(self, token_embeddings: torch.Tensor) -> dict[str, np.ndarray]:
+        assert self._sae is not None
+        total_tokens = int(token_embeddings.shape[0])
+        if total_tokens == 0:
+            return {
+                "token_index": np.empty((0,), dtype=np.int32),
+                "feature_index": np.empty((0,), dtype=np.int16),
+                "value": np.empty((0,), dtype=np.float16),
+                "num_tokens": 0,
+            }
+
+        d_sae = int(self._sae.encoder_weight.shape[0])
+        feat_dtype = np.int16 if d_sae <= np.iinfo(np.int16).max else np.int32
+        token_idx_parts: list[np.ndarray] = []
+        feat_idx_parts: list[np.ndarray] = []
+        value_parts: list[np.ndarray] = []
+
+        threshold = float(self._sae_value_threshold)
+        block_tokens = self._sae_block_tokens
+        with torch.inference_mode():
+            for start in range(0, total_tokens, block_tokens):
+                end = min(start + block_tokens, total_tokens)
+                block = token_embeddings[start:end].to(
+                    device=self.device, dtype=self._sae.encoder_weight.dtype
+                )
+                encoded = self._sae.encode(block)
+                if threshold > 0:
+                    mask = encoded > threshold
+                else:
+                    mask = encoded > 0
+                nz = torch.nonzero(mask, as_tuple=False)
+                if nz.numel() == 0:
+                    continue
+                token_idx = (nz[:, 0] + start).to(torch.int32)
+                feat_idx = nz[:, 1].to(torch.int32)
+                values = encoded[nz[:, 0], nz[:, 1]].to(torch.float16)
+                token_idx_parts.append(token_idx.cpu().numpy())
+                feat_idx_parts.append(
+                    feat_idx.cpu().numpy().astype(feat_dtype, copy=False)
+                )
+                value_parts.append(values.cpu().numpy())
+
+        if token_idx_parts:
+            token_idx_arr = np.concatenate(token_idx_parts)
+            feat_idx_arr = np.concatenate(feat_idx_parts)
+            values_arr = np.concatenate(value_parts)
+        else:
+            token_idx_arr = np.empty((0,), dtype=np.int32)
+            feat_idx_arr = np.empty((0,), dtype=feat_dtype)
+            values_arr = np.empty((0,), dtype=np.float16)
+
+        return {
+            "token_index": token_idx_arr,
+            "feature_index": feat_idx_arr,
+            "value": values_arr,
+            "num_tokens": total_tokens,
+        }
+
     def _pool(
         self,
         hidden_states: torch.Tensor,
@@ -2694,6 +2800,21 @@ class GPUModelRunner(
 
         if raw_pooler_output is None or not any(finished_mask):
             model_runner_output.pooler_output = [None] * num_reqs
+            return model_runner_output
+
+        if self._should_apply_sae(pooling_metadata):
+            self._ensure_sae_loaded()
+            if isinstance(raw_pooler_output, torch.Tensor):
+                raw_outputs: list[torch.Tensor | None] = [raw_pooler_output]
+            else:
+                raw_outputs = list(raw_pooler_output)
+            sae_outputs: list[dict[str, np.ndarray] | None] = []
+            for out, include in zip(raw_outputs, finished_mask):
+                if not include or out is None:
+                    sae_outputs.append(None)
+                    continue
+                sae_outputs.append(self._encode_sae_sparse(out))
+            model_runner_output.pooler_output = sae_outputs
             return model_runner_output
 
         if self.use_async_scheduling:
