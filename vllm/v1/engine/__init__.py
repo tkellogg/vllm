@@ -15,7 +15,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SaeSparseOutput
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors, PoolingOutputPayload
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -139,7 +139,7 @@ class EngineCoreOutput(
     new_logprobs: LogprobsLists | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
 
-    pooling_output: torch.Tensor | SaeSparseOutput | None = None
+    pooling_output: PoolingOutputPayload | None = None
 
     finish_reason: FinishReason | None = None
     stop_reason: int | str | None = None

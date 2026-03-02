@@ -146,6 +146,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     PoolerOutput,
     SaeSparseOutput,
+    PoolingOutputPayload,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
@@ -303,7 +304,7 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
             )
             self.async_copy_ready_event.record()
             self._model_runner_output.pooler_output = [
-                out if include else None
+                PoolingOutputPayload(dense=out) if include else None
                 for out, include in zip(raw_pooler_output_cpu, finished_mask)
             ]
 
@@ -2912,7 +2913,7 @@ class GPUModelRunner(
                 raw_outputs: list[torch.Tensor | None] = [raw_pooler_output]
             else:
                 raw_outputs = list(raw_pooler_output)
-            sae_outputs: list[SaeSparseOutput | None] = []
+            sae_outputs: list[PoolingOutputPayload | None] = []
             for out, include in zip(raw_outputs, finished_mask):
                 if not include or out is None:
                     sae_outputs.append(None)
@@ -2922,10 +2923,11 @@ class GPUModelRunner(
                     int(out.shape[0]),
                     int(out.shape[1]),
                 )
-                sae_outputs.append(self._encode_sae_sparse(out))
+                sae = self._encode_sae_sparse(out)
+                sae_outputs.append(PoolingOutputPayload(sae=sae))
                 logger.info(
                     "SAE sparse encode done: rows=%s",
-                    int(sae_outputs[-1]["value"].shape[0]),
+                    int(sae.value.shape[0]),
                 )
             model_runner_output.pooler_output = sae_outputs
             logger.info("Pool done: SAE output ready")
@@ -2944,7 +2946,7 @@ class GPUModelRunner(
             raw_pooler_output,
         )
         model_runner_output.pooler_output = [
-            out if include else None
+            PoolingOutputPayload(dense=out) if include else None
             for out, include in zip(raw_pooler_output, finished_mask)
         ]
         self._sync_device()

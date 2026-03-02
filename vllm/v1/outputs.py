@@ -118,6 +118,16 @@ class SaeSparseOutput(
     num_tokens: int
 
 
+class PoolingOutputPayload(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    dense: torch.Tensor | None = None
+    sae: SaeSparseOutput | None = None
+
+
 # [num_reqs, <dynamic>]
 # The shape of each element depends on the pooler used
 PoolerOutput: TypeAlias = (
@@ -204,7 +214,7 @@ class ModelRunnerOutput:
     )
 
     # [num_reqs, hidden_size] for dense pooling or SAE sparse outputs.
-    pooler_output: list[PoolingOutputItem] | None = None
+    pooler_output: list[PoolingOutputPayload | None] | None = None
 
     kv_connector_output: KVConnectorOutput | None = None
 
