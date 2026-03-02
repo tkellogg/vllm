@@ -2729,14 +2729,13 @@ class GPUModelRunner(
         total_blocks = (total_tokens + block_tokens - 1) // block_tokens
         total_rows = 0
         start_total = time.monotonic()
-        if _TRACE_SAE:
-            logger.info(
-                "SAE encode start: tokens=%s blocks=%s d_sae=%s threshold=%.6g",
-                total_tokens,
-                total_blocks,
-                d_sae,
-                threshold,
-            )
+        logger.info(
+            "SAE encode start: tokens=%s blocks=%s d_sae=%s threshold=%.6g",
+            total_tokens,
+            total_blocks,
+            d_sae,
+            threshold,
+        )
         with torch.inference_mode():
             for block_idx, start in enumerate(
                 range(0, total_tokens, block_tokens), start=1
@@ -2811,12 +2810,11 @@ class GPUModelRunner(
             feat_idx_arr = np.empty((0,), dtype=feat_dtype)
             values_arr = np.empty((0,), dtype=np.float16)
 
-        if _TRACE_SAE:
-            logger.info(
-                "SAE encode done: rows=%s total_time=%.2fs",
-                int(values_arr.shape[0]),
-                time.monotonic() - start_total,
-            )
+        logger.info(
+            "SAE encode done: rows=%s total_time=%.2fs",
+            int(values_arr.shape[0]),
+            time.monotonic() - start_total,
+        )
 
         return {
             "token_index": token_idx_arr,
@@ -2849,11 +2847,6 @@ class GPUModelRunner(
         raw_pooler_output: PoolerOutput = model.pooler(
             hidden_states=hidden_states, pooling_metadata=pooling_metadata
         )
-        if _TRACE_SAE and self._should_apply_sae(pooling_metadata):
-            logger.info(
-                "SAE pooler output ready: type=%s",
-                type(raw_pooler_output).__name__,
-            )
 
         finished_mask = [
             seq_len == prompt_len
@@ -2871,6 +2864,12 @@ class GPUModelRunner(
             return model_runner_output
 
         if self._should_apply_sae(pooling_metadata):
+            if any(finished_mask):
+                logger.info(
+                    "SAE pooler output ready (finished=%s): type=%s",
+                    finished_mask,
+                    type(raw_pooler_output).__name__,
+                )
             self._ensure_sae_loaded()
             if isinstance(raw_pooler_output, torch.Tensor):
                 raw_outputs: list[torch.Tensor | None] = [raw_pooler_output]
@@ -2881,7 +2880,16 @@ class GPUModelRunner(
                 if not include or out is None:
                     sae_outputs.append(None)
                     continue
+                logger.info(
+                    "SAE sparse encode start: tokens=%s hidden=%s",
+                    int(out.shape[0]),
+                    int(out.shape[1]),
+                )
                 sae_outputs.append(self._encode_sae_sparse(out))
+                logger.info(
+                    "SAE sparse encode done: rows=%s",
+                    int(sae_outputs[-1]["value"].shape[0]),
+                )
             model_runner_output.pooler_output = sae_outputs
             return model_runner_output
 
