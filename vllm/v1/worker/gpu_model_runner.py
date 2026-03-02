@@ -2843,15 +2843,29 @@ class GPUModelRunner(
             num_scheduled_tokens_np, seq_lens_cpu, device=hidden_states.device
         )
 
-        model = cast(VllmModelForPooling, self.model)
-        raw_pooler_output: PoolerOutput = model.pooler(
-            hidden_states=hidden_states, pooling_metadata=pooling_metadata
-        )
-
         finished_mask = [
             seq_len == prompt_len
             for seq_len, prompt_len in zip(seq_lens_cpu, pooling_metadata.prompt_lens)
         ]
+        if any(finished_mask):
+            logger.info(
+                "Pooling pre: tasks=%s sae_enabled=%s finished=%s seq_lens=%s prompt_lens=%s",
+                getattr(pooling_metadata, "tasks", None),
+                self._sae_enabled,
+                finished_mask,
+                seq_lens_cpu.tolist(),
+                pooling_metadata.prompt_lens.tolist(),
+            )
+
+        model = cast(VllmModelForPooling, self.model)
+        raw_pooler_output: PoolerOutput = model.pooler(
+            hidden_states=hidden_states, pooling_metadata=pooling_metadata
+        )
+        if any(finished_mask):
+            logger.info(
+                "Pooling post: type=%s",
+                type(raw_pooler_output).__name__,
+            )
 
         model_runner_output = ModelRunnerOutput(
             req_ids=self.input_batch.req_ids.copy(),
