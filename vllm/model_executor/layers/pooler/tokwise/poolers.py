@@ -6,6 +6,7 @@ from typing import TypeAlias
 import torch
 
 from vllm.config import PoolerConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler import (
     ClassifierFn,
     PoolingParamsUpdate,
@@ -32,6 +33,8 @@ from .methods import (
     TokenPoolingMethodOutputItem,
     get_tok_pooling_method,
 )
+
+logger = init_logger(__name__)
 
 TokenPoolingFn: TypeAlias = Callable[
     [torch.Tensor, PoolingMetadata],
@@ -88,8 +91,16 @@ class TokenPooler(Pooler):
         hidden_states: torch.Tensor,
         pooling_metadata: PoolingMetadata,
     ) -> TokenPoolerOutput:
+        logger.info(
+            "TokenPooler forward: hidden_states=%s prompt_lens=%s tasks=%s",
+            tuple(hidden_states.shape),
+            pooling_metadata.prompt_lens.tolist(),
+            getattr(pooling_metadata, "tasks", None),
+        )
         pooled_data = self.pooling(hidden_states, pooling_metadata)
+        logger.info("TokenPooler after pooling: items=%s", len(pooled_data))
         pooled_data = self.head(pooled_data, pooling_metadata)
+        logger.info("TokenPooler after head: items=%s", len(pooled_data))
         return pooled_data
 
 

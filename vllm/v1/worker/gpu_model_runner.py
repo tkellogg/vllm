@@ -2830,6 +2830,16 @@ class GPUModelRunner(
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        logger.info(
+            "Pool begin: scheduled_tokens=%s scheduled_tokens_np=%s hidden_states=%s",
+            num_scheduled_tokens,
+            num_scheduled_tokens_np.tolist(),
+            tuple(hidden_states.shape),
+        )
+        logger.info(
+            "Pool step: seq_lens_cpu_raw=%s",
+            self.seq_lens.cpu[: self.input_batch.num_reqs].tolist(),
+        )
         num_reqs = self.input_batch.num_reqs
         assert num_reqs == len(self.input_batch.pooling_params), (
             "Either all or none of the requests in a batch must be pooling request"
@@ -2837,35 +2847,46 @@ class GPUModelRunner(
 
         hidden_states = hidden_states[:num_scheduled_tokens]
         seq_lens_cpu = self.seq_lens.cpu[:num_reqs]
+        logger.info(
+            "Pool setup: num_reqs=%s seq_lens=%s",
+            num_reqs,
+            seq_lens_cpu.tolist(),
+        )
 
         pooling_metadata = self.input_batch.get_pooling_metadata()
         pooling_metadata.build_pooling_cursor(
             num_scheduled_tokens_np, seq_lens_cpu, device=hidden_states.device
+        )
+        logger.info(
+            "Pool cursor built: prompt_lens=%s tasks=%s",
+            pooling_metadata.prompt_lens.tolist(),
+            getattr(pooling_metadata, "tasks", None),
         )
 
         finished_mask = [
             seq_len == prompt_len
             for seq_len, prompt_len in zip(seq_lens_cpu, pooling_metadata.prompt_lens)
         ]
-        if any(finished_mask):
-            logger.info(
-                "Pooling pre: tasks=%s sae_enabled=%s finished=%s seq_lens=%s prompt_lens=%s",
-                getattr(pooling_metadata, "tasks", None),
-                self._sae_enabled,
-                finished_mask,
-                seq_lens_cpu.tolist(),
-                pooling_metadata.prompt_lens.tolist(),
-            )
+        logger.info(
+            "Pooling pre: tokens=%s tasks=%s sae_enabled=%s finished=%s seq_lens=%s prompt_lens=%s scheduled=%s",
+            num_scheduled_tokens,
+            getattr(pooling_metadata, "tasks", None),
+            self._sae_enabled,
+            finished_mask,
+            seq_lens_cpu.tolist(),
+            pooling_metadata.prompt_lens.tolist(),
+            num_scheduled_tokens_np.tolist(),
+        )
 
         model = cast(VllmModelForPooling, self.model)
+        logger.info("Pooler call start")
         raw_pooler_output: PoolerOutput = model.pooler(
             hidden_states=hidden_states, pooling_metadata=pooling_metadata
         )
-        if any(finished_mask):
-            logger.info(
-                "Pooling post: type=%s",
-                type(raw_pooler_output).__name__,
-            )
+        logger.info(
+            "Pooling post: type=%s",
+            type(raw_pooler_output).__name__,
+        )
 
         model_runner_output = ModelRunnerOutput(
             req_ids=self.input_batch.req_ids.copy(),
@@ -2875,6 +2896,7 @@ class GPUModelRunner(
 
         if raw_pooler_output is None or not any(finished_mask):
             model_runner_output.pooler_output = [None] * num_reqs
+            logger.info("Pool done: no output (finished=%s)", finished_mask)
             return model_runner_output
 
         if self._should_apply_sae(pooling_metadata):
@@ -2905,6 +2927,7 @@ class GPUModelRunner(
                     int(sae_outputs[-1]["value"].shape[0]),
                 )
             model_runner_output.pooler_output = sae_outputs
+            logger.info("Pool done: SAE output ready")
             return model_runner_output
 
         if self.use_async_scheduling:
@@ -2925,6 +2948,7 @@ class GPUModelRunner(
         ]
         self._sync_device()
 
+        logger.info("Pool done: raw output copied")
         return model_runner_output
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:

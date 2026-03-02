@@ -8,10 +8,13 @@ import torch
 import torch.nn as nn
 
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.config.pooler import TokenPoolingType
 from vllm.model_executor.layers.pooler import PoolingParamsUpdate
 from vllm.tasks import PoolingTask
 from vllm.v1.pool.metadata import PoolingMetadata
+
+logger = init_logger(__name__)
 
 TokenPoolingMethodOutputItem: TypeAlias = torch.Tensor | None
 
@@ -46,13 +49,25 @@ class AllPool(TokenPoolingMethod):
         hidden_states: torch.Tensor,
         pooling_metadata: PoolingMetadata,
     ) -> list[TokenPoolingMethodOutputItem]:
+        logger.info(
+            "AllPool forward: hidden_states=%s prompt_lens=%s",
+            tuple(hidden_states.shape),
+            pooling_metadata.prompt_lens.tolist(),
+        )
         pooling_cursor = pooling_metadata.get_pooling_cursor()
+        logger.info(
+            "AllPool cursor: num_scheduled=%s prompt_lens=%s seq_lens=%s",
+            pooling_cursor.num_scheduled_tokens_cpu.tolist(),
+            pooling_cursor.prompt_lens_cpu.tolist(),
+            pooling_cursor.seq_lens_cpu.tolist(),
+        )
         hidden_states_all = hidden_states.split(
             pooling_cursor.num_scheduled_tokens_cpu.tolist()
         )
         hidden_states_lst = [hidden_states_all[i] for i in pooling_cursor.index]
 
         if not self.enable_chunked_prefill:
+            logger.info("AllPool output (no chunked prefill): items=%s", len(hidden_states_lst))
             return hidden_states_lst
 
         pooling_states = pooling_metadata.pooling_states
@@ -75,6 +90,11 @@ class AllPool(TokenPoolingMethod):
             else:
                 output_list.append(None)
 
+        logger.info(
+            "AllPool output (chunked): items=%s finished=%s",
+            len(output_list),
+            pooling_cursor.is_finished().tolist(),
+        )
         return output_list
 
 

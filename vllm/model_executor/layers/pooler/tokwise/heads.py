@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.layers.pooler import ActivationFn, ClassifierFn, ProjectorFn
+from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 from vllm.v1.pool.metadata import PoolingMetadata
@@ -15,6 +16,8 @@ from vllm.v1.pool.metadata import PoolingMetadata
 from .methods import TokenPoolingMethodOutputItem
 
 TokenPoolerHeadOutputItem: TypeAlias = torch.Tensor | None
+
+logger = init_logger(__name__)
 
 
 class TokenPoolerHead(nn.Module, ABC):
@@ -38,6 +41,11 @@ class TokenPoolerHead(nn.Module, ABC):
         pooling_params = pooling_metadata.pooling_params
         assert len(pooled_data) == len(pooling_params)
 
+        logger.info(
+            "TokenPoolerHead forward: items=%s params=%s",
+            len(pooled_data),
+            len(pooling_params),
+        )
         return [self.forward_chunk(d, p) for d, p in zip(pooled_data, pooling_params)]
 
 
@@ -64,7 +72,9 @@ class TokenEmbeddingPoolerHead(TokenPoolerHead):
     ) -> TokenPoolerHeadOutputItem:
         # for unfinished chunked prefill
         if pooled_data is None:
+            logger.info("TokenEmbeddingPoolerHead: chunk not finished")
             return None
+        logger.info("TokenEmbeddingPoolerHead: chunk tokens=%s", pooled_data.shape[0])
 
         if self.head_dtype is not None:
             pooled_data = pooled_data.to(self.head_dtype)

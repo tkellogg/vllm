@@ -102,6 +102,9 @@ class PoolingMetadata:
         seq_lens_cpu: torch.Tensor,
         device: torch.device,
     ):
+        from vllm.logger import init_logger
+
+        logger = init_logger(__name__)
         n_seq = len(num_scheduled_tokens_np)
         prompt_lens = self.prompt_lens
 
@@ -121,4 +124,11 @@ class PoolingMetadata:
             prompt_lens_cpu=prompt_lens,
             seq_lens_cpu=seq_lens_cpu,
             num_scheduled_tokens_cpu=num_scheduled_tokens_cpu,
+        )
+        logger.info(
+            "Pooling cursor: n_seq=%s scheduled=%s prompt_lens=%s seq_lens=%s",
+            n_seq,
+            num_scheduled_tokens_cpu.tolist(),
+            prompt_lens.tolist(),
+            seq_lens_cpu.tolist(),
         )
