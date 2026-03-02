@@ -28,6 +28,7 @@ from vllm.tracing import (
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.outputs import PoolingOutputPayload
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -269,7 +270,7 @@ class RequestState:
     def make_request_output(
         self,
         new_token_ids: list[int],
-        pooling_output: torch.Tensor | None,
+        pooling_output: "PoolingOutputPayload | None",
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
@@ -407,7 +408,7 @@ class RequestState:
             stop_reason=stop_reason if finished else None,
         )
 
-    def _new_pooling_output(self, pooling_output: Any) -> PoolingOutput:
+    def _new_pooling_output(self, pooling_output: PoolingOutputPayload) -> PoolingOutput:
         return PoolingOutput(data=pooling_output)
 
 
