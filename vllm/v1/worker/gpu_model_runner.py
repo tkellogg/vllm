@@ -145,6 +145,7 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
     PoolerOutput,
+    SaeSparseOutput,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
@@ -2707,16 +2708,16 @@ class GPUModelRunner(
             self._sae_block_tokens,
         )
 
-    def _encode_sae_sparse(self, token_embeddings: torch.Tensor) -> dict[str, np.ndarray]:
+    def _encode_sae_sparse(self, token_embeddings: torch.Tensor) -> SaeSparseOutput:
         assert self._sae is not None
         total_tokens = int(token_embeddings.shape[0])
         if total_tokens == 0:
-            return {
-                "token_index": np.empty((0,), dtype=np.int32),
-                "feature_index": np.empty((0,), dtype=np.int16),
-                "value": np.empty((0,), dtype=np.float16),
-                "num_tokens": 0,
-            }
+            return SaeSparseOutput(
+                token_index=np.empty((0,), dtype=np.int32),
+                feature_index=np.empty((0,), dtype=np.int16),
+                value=np.empty((0,), dtype=np.float16),
+                num_tokens=0,
+            )
 
         d_sae = int(self._sae.encoder_weight.shape[0])
         feat_dtype = np.int16 if d_sae <= np.iinfo(np.int16).max else np.int32
@@ -2816,12 +2817,12 @@ class GPUModelRunner(
             time.monotonic() - start_total,
         )
 
-        return {
-            "token_index": token_idx_arr,
-            "feature_index": feat_idx_arr,
-            "value": values_arr,
-            "num_tokens": total_tokens,
-        }
+        return SaeSparseOutput(
+            token_index=token_idx_arr,
+            feature_index=feat_idx_arr,
+            value=values_arr,
+            num_tokens=total_tokens,
+        )
 
     def _pool(
         self,
@@ -2911,7 +2912,7 @@ class GPUModelRunner(
                 raw_outputs: list[torch.Tensor | None] = [raw_pooler_output]
             else:
                 raw_outputs = list(raw_pooler_output)
-            sae_outputs: list[dict[str, np.ndarray] | None] = []
+            sae_outputs: list[SaeSparseOutput | None] = []
             for out, include in zip(raw_outputs, finished_mask):
                 if not include or out is None:
                     sae_outputs.append(None)

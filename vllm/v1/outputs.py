@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 
+import msgspec
 import numpy as np
 import torch
 
@@ -105,15 +106,29 @@ class LogprobsTensors(NamedTuple):
         )
 
 
+class SaeSparseOutput(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    token_index: np.ndarray
+    feature_index: np.ndarray
+    value: np.ndarray
+    num_tokens: int
+
+
 # [num_reqs, <dynamic>]
 # The shape of each element depends on the pooler used
 PoolerOutput: TypeAlias = (
     torch.Tensor
-    | dict[str, np.ndarray]
+    | SaeSparseOutput
     | list[torch.Tensor]
     | list[torch.Tensor | None]
-    | list[dict[str, np.ndarray] | None]
+    | list[SaeSparseOutput | None]
 )
+
+PoolingOutputItem: TypeAlias = torch.Tensor | SaeSparseOutput | None
 
 
 @dataclass
@@ -188,8 +203,8 @@ class ModelRunnerOutput:
         default_factory=dict
     )
 
-    # [num_reqs, hidden_size]
-    pooler_output: list[torch.Tensor | dict[str, np.ndarray] | None] | None = None
+    # [num_reqs, hidden_size] for dense pooling or SAE sparse outputs.
+    pooler_output: list[PoolingOutputItem] | None = None
 
     kv_connector_output: KVConnectorOutput | None = None
 
