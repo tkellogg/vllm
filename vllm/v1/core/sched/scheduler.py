@@ -379,9 +379,13 @@ class Scheduler(SchedulerInterface):
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
-            )
+            # Pooling requests need to allow prompts up to max_model_len.
+            # The "-1" reserve is for generation/spec decode paths.
+            if request.pooling_params is not None:
+                max_new_tokens = self.max_model_len - request.num_computed_tokens
+            else:
+                max_new_tokens = self.max_model_len - 1 - request.num_computed_tokens
+            num_new_tokens = min(num_new_tokens, max_new_tokens)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
