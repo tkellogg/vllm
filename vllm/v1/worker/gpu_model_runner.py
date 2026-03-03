@@ -202,6 +202,9 @@ _TRACE_MODEL_MIN_TOKENS = int(os.environ.get("VLLM_TRACE_MODEL_MIN_TOKENS", "0")
 _TRACE_SAE = os.environ.get("VLLM_SAE_TRACE") == "1"
 _TRACE_SAE_EVERY = int(os.environ.get("VLLM_SAE_TRACE_EVERY", "20"))
 _TRACE_SAE_MIN_MS = float(os.environ.get("VLLM_SAE_TRACE_MIN_MS", "1000"))
+_SAE_HIST = os.environ.get("VLLM_SAE_HIST") == "1"
+_SAE_HIST_MIN_EXP = int(os.environ.get("VLLM_SAE_HIST_MIN_EXP", "-10"))
+_SAE_HIST_MAX_EXP = int(os.environ.get("VLLM_SAE_HIST_MAX_EXP", "0"))
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -2730,6 +2733,29 @@ class GPUModelRunner(
         block_tokens = self._sae_block_tokens
         total_blocks = (total_tokens + block_tokens - 1) // block_tokens
         total_rows = 0
+        hist_enabled = _SAE_HIST or _TRACE_SAE
+        hist_min_exp = _SAE_HIST_MIN_EXP
+        hist_max_exp = _SAE_HIST_MAX_EXP
+        hist_boundaries = None
+        hist_counts = None
+        hist_zero = None
+        if hist_enabled:
+            if hist_min_exp > hist_max_exp:
+                logger.warning(
+                    "VLLM_SAE_HIST_MIN_EXP > VLLM_SAE_HIST_MAX_EXP; swapping."
+                )
+                hist_min_exp, hist_max_exp = hist_max_exp, hist_min_exp
+            hist_boundaries = torch.tensor(
+                [10.0 ** exp for exp in range(hist_min_exp, hist_max_exp + 1)],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            hist_counts = torch.zeros(
+                (hist_boundaries.numel() + 1,),
+                device=self.device,
+                dtype=torch.int64,
+            )
+            hist_zero = torch.zeros((), device=self.device, dtype=torch.int64)
         start_total = time.monotonic()
         logger.info(
             "SAE encode start: tokens=%s blocks=%s d_sae=%s threshold=%.6g",
@@ -2749,6 +2775,15 @@ class GPUModelRunner(
                 )
                 encoded = self._sae.encode(block)
                 t1 = time.monotonic()
+                if hist_enabled and hist_boundaries is not None:
+                    hist_values = encoded.float().reshape(-1)
+                    hist_zero += (hist_values == 0).sum()
+                    bucket_idx = torch.bucketize(
+                        hist_values, hist_boundaries, right=False
+                    )
+                    hist_counts += torch.bincount(
+                        bucket_idx, minlength=hist_counts.numel()
+                    )
                 if threshold > 0:
                     mask = encoded > threshold
                 else:
@@ -2817,6 +2852,32 @@ class GPUModelRunner(
             int(values_arr.shape[0]),
             time.monotonic() - start_total,
         )
+        if (
+            hist_enabled
+            and hist_counts is not None
+            and hist_boundaries is not None
+            and hist_zero is not None
+        ):
+            counts_cpu = hist_counts.cpu().tolist()
+            zero_cpu = int(hist_zero.item())
+            total_elems = int(total_tokens) * int(d_sae)
+            nonzero = max(total_elems - zero_cpu, 0)
+            if counts_cpu:
+                counts_cpu[0] = max(counts_cpu[0] - zero_cpu, 0)
+            bins = []
+            bins.append(f"<1e{hist_min_exp}={counts_cpu[0] if counts_cpu else 0}")
+            for idx, exp in enumerate(range(hist_min_exp, hist_max_exp)):
+                bucket = counts_cpu[idx + 1] if idx + 1 < len(counts_cpu) else 0
+                bins.append(f"[1e{exp},1e{exp + 1})={bucket}")
+            bins.append(f">=1e{hist_max_exp}={counts_cpu[-1] if counts_cpu else 0}")
+            logger.info(
+                "SAE hist pre-value-threshold: total=%s nz=%s zero=%s (%.2f%%) bins=%s",
+                total_elems,
+                nonzero,
+                zero_cpu,
+                100.0 * zero_cpu / max(1, total_elems),
+                " ".join(bins),
+            )
 
         return SaeSparseOutput(
             token_index=token_idx_arr,
