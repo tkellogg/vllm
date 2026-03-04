@@ -205,6 +205,7 @@ _TRACE_SAE_MIN_MS = float(os.environ.get("VLLM_SAE_TRACE_MIN_MS", "1000"))
 _SAE_HIST = os.environ.get("VLLM_SAE_HIST") == "1"
 _SAE_HIST_MIN_EXP = int(os.environ.get("VLLM_SAE_HIST_MIN_EXP", "-10"))
 _SAE_HIST_MAX_EXP = int(os.environ.get("VLLM_SAE_HIST_MAX_EXP", "0"))
+_SAE_RETURN_DENSE = os.environ.get("VLLM_SAE_RETURN_DENSE") == "1"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -2979,13 +2980,16 @@ class GPUModelRunner(
                 if not include or out is None:
                     sae_outputs.append(None)
                     continue
+                dense_payload = None
+                if _SAE_RETURN_DENSE:
+                    dense_payload = out.to("cpu", non_blocking=True)
                 logger.info(
                     "SAE sparse encode start: tokens=%s hidden=%s",
                     int(out.shape[0]),
                     int(out.shape[1]),
                 )
                 sae = self._encode_sae_sparse(out)
-                sae_outputs.append(PoolingOutputPayload(sae=sae))
+                sae_outputs.append(PoolingOutputPayload(dense=dense_payload, sae=sae))
                 logger.info(
                     "SAE sparse encode done: rows=%s",
                     int(sae.value.shape[0]),
