@@ -106,6 +106,24 @@ class LogprobsTensors(NamedTuple):
         )
 
 
+class RoutingSparseOutput(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    """Per-token routing data from MoE layers in COO format."""
+
+    token_index: np.ndarray
+    layer_index: np.ndarray
+    expert_index: np.ndarray
+    gate_value: np.ndarray
+    num_tokens: int
+    num_layers: int
+    num_experts: int = 72
+    top_k: int = 10
+
+
 class SaeSparseOutput(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -116,6 +134,7 @@ class SaeSparseOutput(
     feature_index: np.ndarray
     value: np.ndarray
     num_tokens: int
+    routing: RoutingSparseOutput | None = None
 
 
 class PoolingOutputPayload(

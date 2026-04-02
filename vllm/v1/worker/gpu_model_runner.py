@@ -145,8 +145,9 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
     PoolerOutput,
-    SaeSparseOutput,
     PoolingOutputPayload,
+    RoutingSparseOutput,
+    SaeSparseOutput,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
@@ -206,6 +207,7 @@ _SAE_HIST = os.environ.get("VLLM_SAE_HIST") == "1"
 _SAE_HIST_MIN_EXP = int(os.environ.get("VLLM_SAE_HIST_MIN_EXP", "-10"))
 _SAE_HIST_MAX_EXP = int(os.environ.get("VLLM_SAE_HIST_MAX_EXP", "0"))
 _SAE_RETURN_DENSE = os.environ.get("VLLM_SAE_RETURN_DENSE") == "1"
+_ROUTING_CAPTURE = os.environ.get("VLLM_ROUTING_CAPTURE") == "1"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -439,6 +441,9 @@ class GPUModelRunner(
         self._sae_value_threshold = float(
             os.environ.get("VLLM_SAE_VALUE_THRESHOLD", "0")
         )
+        self._routing_capture_layers: list[tuple[int, Any]] = []
+        self._routing_capture_num_layers = 0
+        self._routing_capture_cache: dict[str, list[RoutingSparseOutput]] = {}
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -911,6 +916,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._routing_capture_cache.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1204,6 +1210,7 @@ class GPUModelRunner(
         previously generated but now are input context (part of the prompt).
         """
         self.input_batch.remove_request(req_id)
+        self._routing_capture_cache.pop(req_id, None)
         req_state = self.requests[req_id]
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
@@ -2707,13 +2714,248 @@ class GPUModelRunner(
 
         self._sae = sae.to(device=self.device, dtype=self.model_config.dtype)
         self._sae_layer = int(layer)
+        self._routing_capture_layers = []
+        self._routing_capture_num_layers = int(
+            max_layer if max_layer is not None else self._sae_layer
+        ) + 1
+        if _ROUTING_CAPTURE:
+            model_root = getattr(self.model, "model", None)
+            model_layers = getattr(model_root, "layers", None)
+            capture_limit = self._routing_capture_num_layers
+            if model_layers is None:
+                logger.warning(
+                    "Routing capture requested but model has no model.layers attribute."
+                )
+            else:
+                for layer_idx in range(min(len(model_layers), capture_limit)):
+                    block_sparse_moe = getattr(
+                        model_layers[layer_idx], "block_sparse_moe", None
+                    )
+                    if block_sparse_moe is None:
+                        continue
+                    block_sparse_moe.capture_routing = True
+                    block_sparse_moe._last_router_logits = None
+                    self._routing_capture_layers.append((layer_idx, block_sparse_moe))
+                logger.info(
+                    "Enabled routing capture on %s MoE layers (max_layer=%s).",
+                    len(self._routing_capture_layers),
+                    capture_limit - 1,
+                )
         logger.info(
             "Loaded SAE weights (layer=%s, block_tokens=%s).",
             self._sae_layer,
             self._sae_block_tokens,
         )
 
-    def _encode_sae_sparse(self, token_embeddings: torch.Tensor) -> SaeSparseOutput:
+    @staticmethod
+    def _empty_routing_output(
+        num_tokens: int,
+        num_layers: int,
+        *,
+        num_experts: int = 72,
+        top_k: int = 10,
+    ) -> RoutingSparseOutput:
+        return RoutingSparseOutput(
+            token_index=np.empty((0,), dtype=np.int32),
+            layer_index=np.empty((0,), dtype=np.int16),
+            expert_index=np.empty((0,), dtype=np.int8),
+            gate_value=np.empty((0,), dtype=np.float16),
+            num_tokens=num_tokens,
+            num_layers=num_layers,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+    def _collect_routing_logits(self) -> RoutingSparseOutput | None:
+        if not _ROUTING_CAPTURE or not self._routing_capture_layers:
+            return None
+
+        token_index_parts: list[np.ndarray] = []
+        layer_index_parts: list[np.ndarray] = []
+        expert_index_parts: list[np.ndarray] = []
+        gate_value_parts: list[np.ndarray] = []
+        num_tokens: int | None = None
+        num_experts = 72
+        top_k = 10
+
+        for layer_idx, block_sparse_moe in self._routing_capture_layers:
+            router_logits = block_sparse_moe._last_router_logits
+            block_sparse_moe._last_router_logits = None
+            if router_logits is None:
+                continue
+
+            if router_logits.ndim != 2:
+                raise ValueError(
+                    f"Expected 2D router logits, got shape={tuple(router_logits.shape)}"
+                )
+
+            layer_num_tokens = int(router_logits.shape[0])
+            layer_num_experts = int(router_logits.shape[1])
+            if num_tokens is None:
+                num_tokens = layer_num_tokens
+            elif num_tokens != layer_num_tokens:
+                raise ValueError(
+                    "Routing capture token mismatch across layers: "
+                    f"expected {num_tokens}, got {layer_num_tokens} for layer {layer_idx}"
+                )
+
+            layer_top_k = min(10, layer_num_experts)
+            topk_values, topk_indices = torch.topk(
+                router_logits, k=layer_top_k, dim=-1
+            )
+            topk_gate_values = torch.softmax(topk_values, dim=-1).to(torch.float16)
+            token_index = (
+                torch.arange(layer_num_tokens, device=router_logits.device, dtype=torch.int32)
+                .unsqueeze(1)
+                .expand(-1, layer_top_k)
+                .reshape(-1)
+            )
+            layer_index = torch.full(
+                (layer_num_tokens, layer_top_k),
+                layer_idx,
+                device=router_logits.device,
+                dtype=torch.int16,
+            ).reshape(-1)
+            expert_index = topk_indices.to(torch.int8).reshape(-1)
+
+            token_index_parts.append(token_index.cpu().numpy())
+            layer_index_parts.append(layer_index.cpu().numpy())
+            expert_index_parts.append(expert_index.cpu().numpy())
+            gate_value_parts.append(topk_gate_values.reshape(-1).cpu().numpy())
+            num_experts = layer_num_experts
+            top_k = layer_top_k
+
+        if num_tokens is None:
+            return None
+
+        return RoutingSparseOutput(
+            token_index=np.concatenate(token_index_parts)
+            if token_index_parts
+            else np.empty((0,), dtype=np.int32),
+            layer_index=np.concatenate(layer_index_parts)
+            if layer_index_parts
+            else np.empty((0,), dtype=np.int16),
+            expert_index=np.concatenate(expert_index_parts)
+            if expert_index_parts
+            else np.empty((0,), dtype=np.int8),
+            gate_value=np.concatenate(gate_value_parts)
+            if gate_value_parts
+            else np.empty((0,), dtype=np.float16),
+            num_tokens=num_tokens,
+            num_layers=self._routing_capture_num_layers,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+    @staticmethod
+    def _split_routing_output(
+        routing: RoutingSparseOutput | None,
+        token_counts: Sequence[int],
+    ) -> list[RoutingSparseOutput | None]:
+        if routing is None:
+            return [None] * len(token_counts)
+
+        outputs: list[RoutingSparseOutput | None] = []
+        start = 0
+        for token_count in token_counts:
+            end = start + int(token_count)
+            mask = (routing.token_index >= start) & (routing.token_index < end)
+            if np.any(mask):
+                outputs.append(
+                    RoutingSparseOutput(
+                        token_index=(routing.token_index[mask] - start).astype(
+                            np.int32, copy=False
+                        ),
+                        layer_index=routing.layer_index[mask].astype(
+                            np.int16, copy=False
+                        ),
+                        expert_index=routing.expert_index[mask].astype(
+                            np.int8, copy=False
+                        ),
+                        gate_value=routing.gate_value[mask].astype(
+                            np.float16, copy=False
+                        ),
+                        num_tokens=int(token_count),
+                        num_layers=routing.num_layers,
+                        num_experts=routing.num_experts,
+                        top_k=routing.top_k,
+                    )
+                )
+            else:
+                outputs.append(None)
+            start = end
+        return outputs
+
+    def _finalize_routing_output(
+        self, req_id: str, num_tokens: int
+    ) -> RoutingSparseOutput | None:
+        chunks = self._routing_capture_cache.pop(req_id, None)
+        if not chunks:
+            return None
+
+        if len(chunks) == 1 and chunks[0].num_tokens == num_tokens:
+            return chunks[0]
+
+        num_layers = chunks[0].num_layers
+        num_experts = chunks[0].num_experts
+        top_k = chunks[0].top_k
+        total_tokens = 0
+        token_offset = 0
+        token_index_parts: list[np.ndarray] = []
+        layer_index_parts: list[np.ndarray] = []
+        expert_index_parts: list[np.ndarray] = []
+        gate_value_parts: list[np.ndarray] = []
+
+        for chunk in chunks:
+            total_tokens += chunk.num_tokens
+            if chunk.token_index.size > 0:
+                token_index_parts.append(
+                    chunk.token_index.astype(np.int32, copy=False) + token_offset
+                )
+                layer_index_parts.append(
+                    chunk.layer_index.astype(np.int16, copy=False)
+                )
+                expert_index_parts.append(
+                    chunk.expert_index.astype(np.int8, copy=False)
+                )
+                gate_value_parts.append(
+                    chunk.gate_value.astype(np.float16, copy=False)
+                )
+            token_offset += chunk.num_tokens
+
+        if total_tokens != num_tokens:
+            logger.warning(
+                "Routing capture token mismatch for request %s: expected %s, got %s.",
+                req_id,
+                num_tokens,
+                total_tokens,
+            )
+            return None
+
+        if not token_index_parts:
+            return self._empty_routing_output(
+                num_tokens=num_tokens,
+                num_layers=num_layers,
+                num_experts=num_experts,
+                top_k=top_k,
+            )
+
+        return RoutingSparseOutput(
+            token_index=np.concatenate(token_index_parts),
+            layer_index=np.concatenate(layer_index_parts),
+            expert_index=np.concatenate(expert_index_parts),
+            gate_value=np.concatenate(gate_value_parts),
+            num_tokens=num_tokens,
+            num_layers=num_layers,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+    def _encode_sae_sparse(
+        self,
+        token_embeddings: torch.Tensor,
+        routing: RoutingSparseOutput | None = None,
+    ) -> SaeSparseOutput:
         assert self._sae is not None
         total_tokens = int(token_embeddings.shape[0])
         if total_tokens == 0:
@@ -2722,6 +2964,7 @@ class GPUModelRunner(
                 feature_index=np.empty((0,), dtype=np.int16),
                 value=np.empty((0,), dtype=np.float16),
                 num_tokens=0,
+                routing=routing,
             )
 
         d_sae = int(self._sae.encoder_weight.shape[0])
@@ -2885,6 +3128,7 @@ class GPUModelRunner(
             feature_index=feat_idx_arr,
             value=values_arr,
             num_tokens=total_tokens,
+            routing=routing,
         )
 
     def _pool(
@@ -2958,12 +3202,8 @@ class GPUModelRunner(
             kv_connector_output=kv_connector_output,
         )
 
-        if raw_pooler_output is None or not any(finished_mask):
-            model_runner_output.pooler_output = [None] * num_reqs
-            logger.info("Pool done: no output (finished=%s)", finished_mask)
-            return model_runner_output
-
-        if self._should_apply_sae(pooling_metadata):
+        apply_sae = self._should_apply_sae(pooling_metadata)
+        if apply_sae:
             if any(finished_mask):
                 logger.info(
                     "SAE pooler output ready (finished=%s): type=%s",
@@ -2971,24 +3211,41 @@ class GPUModelRunner(
                     type(raw_pooler_output).__name__,
                 )
             self._ensure_sae_loaded()
+            batch_routing = self._collect_routing_logits()
+            routing_chunks = self._split_routing_output(
+                batch_routing,
+                [int(token_count) for token_count in num_scheduled_tokens_np.tolist()],
+            )
+            for req_id, chunk in zip(self.input_batch.req_ids[:num_reqs], routing_chunks):
+                if chunk is not None:
+                    self._routing_capture_cache.setdefault(req_id, []).append(chunk)
+
+        if raw_pooler_output is None or not any(finished_mask):
+            model_runner_output.pooler_output = [None] * num_reqs
+            logger.info("Pool done: no output (finished=%s)", finished_mask)
+            return model_runner_output
+
+        if apply_sae:
             if isinstance(raw_pooler_output, torch.Tensor):
                 raw_outputs: list[torch.Tensor | None] = [raw_pooler_output]
             else:
                 raw_outputs = list(raw_pooler_output)
             sae_outputs: list[PoolingOutputPayload | None] = []
-            for out, include in zip(raw_outputs, finished_mask):
+            req_ids = self.input_batch.req_ids[:num_reqs]
+            for req_id, out, include in zip(req_ids, raw_outputs, finished_mask):
                 if not include or out is None:
                     sae_outputs.append(None)
                     continue
                 dense_payload = None
                 if _SAE_RETURN_DENSE:
                     dense_payload = out.to("cpu", non_blocking=True)
+                routing = self._finalize_routing_output(req_id, int(out.shape[0]))
                 logger.info(
                     "SAE sparse encode start: tokens=%s hidden=%s",
                     int(out.shape[0]),
                     int(out.shape[1]),
                 )
-                sae = self._encode_sae_sparse(out)
+                sae = self._encode_sae_sparse(out, routing=routing)
                 sae_outputs.append(PoolingOutputPayload(dense=dense_payload, sae=sae))
                 logger.info(
                     "SAE sparse encode done: rows=%s",
@@ -3829,6 +4086,11 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+
+        if self.is_pooling_model and self._sae_enabled:
+            pooling_metadata = self.input_batch.get_pooling_metadata()
+            if self._should_apply_sae(pooling_metadata):
+                self._ensure_sae_loaded()
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

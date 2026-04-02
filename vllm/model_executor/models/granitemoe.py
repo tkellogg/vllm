@@ -72,6 +72,9 @@ class GraniteMoeMoE(nn.Module):
     across ranks.
     """
 
+    capture_routing: bool
+    _last_router_logits: torch.Tensor | None
+
     def __init__(
         self,
         num_experts: int,
@@ -87,6 +90,8 @@ class GraniteMoeMoE(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.is_sequence_parallel = is_sequence_parallel
+        self.capture_routing = False
+        self.register_buffer("_last_router_logits", None, persistent=False)
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -122,6 +127,8 @@ class GraniteMoeMoE(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        if self.capture_routing:
+            self._last_router_logits = router_logits.detach()
         final_hidden_states = self.experts(hidden_states, router_logits)
 
         if self.is_sequence_parallel:
