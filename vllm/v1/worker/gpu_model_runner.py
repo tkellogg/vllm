@@ -442,6 +442,8 @@ class GPUModelRunner(
             os.environ.get("VLLM_SAE_VALUE_THRESHOLD", "0")
         )
         self._routing_capture_layers: list[tuple[int, Any]] = []
+        self._routing_hook_storage: dict[int, list[torch.Tensor]] = {}
+        self._routing_hook_handles: list[torch.utils.hooks.RemovableHandle] = []
         self._routing_capture_num_layers = 0
         self._routing_capture_cache: dict[str, list[RoutingSparseOutput]] = {}
 
@@ -2694,6 +2696,16 @@ class GPUModelRunner(
             return False
         return all(task == "token_embed" for task in tasks)
 
+    def _clear_routing_capture_hooks(self) -> None:
+        for handle in getattr(self, "_routing_hook_handles", []):
+            handle.remove()
+        getattr(self, "_routing_hook_handles", []).clear()
+
+        for storage in getattr(self, "_routing_hook_storage", {}).values():
+            storage.clear()
+        getattr(self, "_routing_hook_storage", {}).clear()
+        getattr(self, "_routing_capture_layers", []).clear()
+
     def _ensure_sae_loaded(self) -> None:
         if not self._sae_enabled or self._sae is not None:
             return
@@ -2714,7 +2726,7 @@ class GPUModelRunner(
 
         self._sae = sae.to(device=self.device, dtype=self.model_config.dtype)
         self._sae_layer = int(layer)
-        self._routing_capture_layers = []
+        GPUModelRunner._clear_routing_capture_hooks(self)
         self._routing_capture_num_layers = int(
             max_layer if max_layer is not None else self._sae_layer
         ) + 1
@@ -2733,9 +2745,20 @@ class GPUModelRunner(
                     )
                     if block_sparse_moe is None:
                         continue
-                    block_sparse_moe.capture_routing = True
-                    block_sparse_moe._last_router_logits = None
-                    self._routing_capture_layers.append((layer_idx, block_sparse_moe))
+                    gate = getattr(block_sparse_moe, "gate", None)
+                    if gate is None:
+                        continue
+
+                    storage: list[torch.Tensor] = []
+                    self._routing_hook_storage[layer_idx] = storage
+
+                    def _hook(_module, _inputs, output, _storage=storage):
+                        logits = output[0] if isinstance(output, tuple) else output
+                        _storage.append(logits.detach())
+
+                    handle = gate.register_forward_hook(_hook)
+                    self._routing_hook_handles.append(handle)
+                    self._routing_capture_layers.append((layer_idx, gate))
                 logger.info(
                     "Enabled routing capture on %s MoE layers (max_layer=%s).",
                     len(self._routing_capture_layers),
@@ -2778,11 +2801,12 @@ class GPUModelRunner(
         num_experts = 72
         top_k = 10
 
-        for layer_idx, block_sparse_moe in self._routing_capture_layers:
-            router_logits = block_sparse_moe._last_router_logits
-            block_sparse_moe._last_router_logits = None
-            if router_logits is None:
+        for layer_idx, _gate in self._routing_capture_layers:
+            storage = self._routing_hook_storage.get(layer_idx)
+            if not storage:
                 continue
+            router_logits = storage[-1]
+            storage.clear()
 
             if router_logits.ndim != 2:
                 raise ValueError(

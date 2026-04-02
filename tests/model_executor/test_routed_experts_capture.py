@@ -167,74 +167,114 @@ class DummySae:
         return self
 
 
-def _make_dummy_granitemoe(monkeypatch):
-    import vllm.model_executor.models.granitemoe as granitemoe_module
+class DummyGate(nn.Module):
+    def __init__(self, hidden_size=4, num_experts=72, *, return_tuple=True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.return_tuple = return_tuple
 
-    class DummyGate(nn.Module):
-        def __init__(self, hidden_size, num_experts, **kwargs):
-            super().__init__()
-            self.num_experts = num_experts
-
-        def forward(self, hidden_states):
-            logits = torch.arange(
-                hidden_states.shape[0] * self.num_experts, dtype=torch.float32
-            ).view(hidden_states.shape[0], self.num_experts)
+    def forward(self, hidden_states):
+        logits = torch.arange(
+            hidden_states.shape[0] * self.num_experts, dtype=torch.float32
+        ).view(hidden_states.shape[0], self.num_experts)
+        if self.return_tuple:
             return logits, None
+        return logits
 
-    class DummyExperts(nn.Module):
-        def __init__(self, **kwargs):
-            super().__init__()
-            self.last_router_logits = None
 
-        def forward(self, hidden_states, router_logits):
-            self.last_router_logits = router_logits
-            return hidden_states
-
-    monkeypatch.setattr(granitemoe_module, "ReplicatedLinear", DummyGate)
-    monkeypatch.setattr(granitemoe_module, "FusedMoE", DummyExperts)
-    return granitemoe_module.GraniteMoeMoE(
-        num_experts=72,
-        top_k=10,
-        hidden_size=4,
-        intermediate_size=8,
+def _make_routing_layer(*, return_tuple=True):
+    return types.SimpleNamespace(
+        block_sparse_moe=types.SimpleNamespace(
+            gate=DummyGate(return_tuple=return_tuple),
+        )
     )
 
 
-def test_granitemoe_moe_capture_routing_disabled(monkeypatch):
-    moe = _make_dummy_granitemoe(monkeypatch)
+def _make_dummy_runner(layers):
+    return types.SimpleNamespace(
+        _sae_enabled=True,
+        _sae=None,
+        _sae_block_tokens=512,
+        _routing_capture_layers=[],
+        _routing_hook_storage={},
+        _routing_hook_handles=[],
+        _routing_capture_num_layers=0,
+        device=torch.device("cpu"),
+        model=types.SimpleNamespace(model=types.SimpleNamespace(layers=layers)),
+        model_config=types.SimpleNamespace(sae_max_layer=1, dtype=torch.float32),
+    )
 
-    _ = moe(torch.randn(2, 4))
 
-    assert moe.capture_routing is False
-    assert moe._last_router_logits is None
+def test_gpu_model_runner_ensure_sae_loaded_registers_routing_hooks(monkeypatch):
+    from vllm.sae import sparse_encoder
+    from vllm.v1.worker import gpu_model_runner as gmr
+
+    monkeypatch.setattr(gmr, "_ROUTING_CAPTURE", True)
+    monkeypatch.setattr(
+        sparse_encoder, "load_sae_from_env", lambda: (DummySae(), 1)
+    )
+
+    layers = [
+        _make_routing_layer(return_tuple=True),
+        _make_routing_layer(return_tuple=False),
+    ]
+    dummy_self = _make_dummy_runner(layers)
+
+    gmr.GPUModelRunner._ensure_sae_loaded(dummy_self)
+
+    assert isinstance(dummy_self._sae, DummySae)
+    assert dummy_self._routing_capture_num_layers == 2
+    assert len(dummy_self._routing_capture_layers) == 2
+    assert len(dummy_self._routing_hook_handles) == 2
+    assert set(dummy_self._routing_hook_storage) == {0, 1}
+    assert dummy_self._routing_capture_layers == [
+        (0, layers[0].block_sparse_moe.gate),
+        (1, layers[1].block_sparse_moe.gate),
+    ]
+    assert all(len(layer.block_sparse_moe.gate._forward_hooks) == 1 for layer in layers)
 
 
-def test_granitemoe_moe_capture_routing_enabled(monkeypatch):
-    moe = _make_dummy_granitemoe(monkeypatch)
-    moe.capture_routing = True
+def test_gpu_model_runner_routing_hook_populates_storage_after_forward(monkeypatch):
+    from vllm.sae import sparse_encoder
+    from vllm.v1.worker import gpu_model_runner as gmr
 
-    _ = moe(torch.randn(2, 4))
+    monkeypatch.setattr(gmr, "_ROUTING_CAPTURE", True)
+    monkeypatch.setattr(
+        sparse_encoder, "load_sae_from_env", lambda: (DummySae(), 1)
+    )
 
+    layers = [
+        _make_routing_layer(return_tuple=True),
+        _make_routing_layer(return_tuple=False),
+    ]
+    dummy_self = _make_dummy_runner(layers)
+
+    gmr.GPUModelRunner._ensure_sae_loaded(dummy_self)
+
+    hidden_states = torch.randn(2, 4)
     expected = torch.arange(2 * 72, dtype=torch.float32).view(2, 72)
-    assert moe._last_router_logits is not None
-    assert torch.equal(moe._last_router_logits, expected)
-    assert not moe._last_router_logits.requires_grad
+
+    _ = layers[0].block_sparse_moe.gate(hidden_states)
+    _ = layers[1].block_sparse_moe.gate(hidden_states)
+
+    assert len(dummy_self._routing_hook_storage[0]) == 1
+    assert len(dummy_self._routing_hook_storage[1]) == 1
+    assert torch.equal(dummy_self._routing_hook_storage[0][0], expected)
+    assert torch.equal(dummy_self._routing_hook_storage[1][0], expected)
 
 
 def test_gpu_model_runner_collect_routing_logits(monkeypatch):
     from vllm.v1.worker import gpu_model_runner as gmr
 
     monkeypatch.setattr(gmr, "_ROUTING_CAPTURE", True)
-    layer0 = types.SimpleNamespace(
-        _last_router_logits=torch.arange(2 * 72, dtype=torch.float32).view(2, 72)
-    )
-    layer3 = types.SimpleNamespace(
-        _last_router_logits=(
-            torch.arange(2 * 72, dtype=torch.float32).view(2, 72) + 1000
-        )
-    )
+    layer0_storage = [torch.arange(2 * 72, dtype=torch.float32).view(2, 72)]
+    layer3_storage = [
+        torch.arange(2 * 72, dtype=torch.float32).view(2, 72) + 1000
+    ]
     dummy_self = types.SimpleNamespace(
-        _routing_capture_layers=[(0, layer0), (3, layer3)],
+        _routing_capture_layers=[(0, object()), (3, object())],
+        _routing_hook_storage={0: layer0_storage, 3: layer3_storage},
         _routing_capture_num_layers=4,
     )
 
@@ -249,8 +289,8 @@ def test_gpu_model_runner_collect_routing_logits(monkeypatch):
     assert routing.num_layers == 4
     assert routing.num_experts == 72
     assert routing.top_k == 10
-    assert layer0._last_router_logits is None
-    assert layer3._last_router_logits is None
+    assert layer0_storage == []
+    assert layer3_storage == []
     assert set(np.unique(routing.layer_index).tolist()) == {0, 3}
 
     mask = (routing.layer_index == 0) & (routing.token_index == 0)
@@ -264,53 +304,15 @@ def test_gpu_model_runner_collect_routing_logits(monkeypatch):
         atol=1e-3,
     )
 
-
-def test_gpu_model_runner_ensure_sae_loaded_enables_routing_capture(monkeypatch):
-    from vllm.sae import sparse_encoder
-    from vllm.v1.worker import gpu_model_runner as gmr
-
-    monkeypatch.setattr(gmr, "_ROUTING_CAPTURE", True)
-    monkeypatch.setattr(
-        sparse_encoder, "load_sae_from_env", lambda: (DummySae(), 1)
-    )
-
-    layers = [
-        types.SimpleNamespace(
-            block_sparse_moe=types.SimpleNamespace(
-                capture_routing=False, _last_router_logits="stale"
-            )
-        )
-        for _ in range(2)
-    ]
-    dummy_self = types.SimpleNamespace(
-        _sae_enabled=True,
-        _sae=None,
-        _sae_block_tokens=512,
-        _routing_capture_layers=[],
-        _routing_capture_num_layers=0,
-        device=torch.device("cpu"),
-        model=types.SimpleNamespace(model=types.SimpleNamespace(layers=layers)),
-        model_config=types.SimpleNamespace(sae_max_layer=1, dtype=torch.float32),
-    )
-
-    gmr.GPUModelRunner._ensure_sae_loaded(dummy_self)
-
-    assert isinstance(dummy_self._sae, DummySae)
-    assert dummy_self._routing_capture_num_layers == 2
-    assert len(dummy_self._routing_capture_layers) == 2
-    assert all(layer.block_sparse_moe.capture_routing for layer in layers)
-    assert all(layer.block_sparse_moe._last_router_logits is None for layer in layers)
-
-
 def test_gpu_model_runner_collect_routing_logits_returns_none_when_disabled(
     monkeypatch,
 ):
     from vllm.v1.worker import gpu_model_runner as gmr
 
     monkeypatch.setattr(gmr, "_ROUTING_CAPTURE", False)
-    layer = types.SimpleNamespace(_last_router_logits=torch.zeros(1, 72))
     dummy_self = types.SimpleNamespace(
-        _routing_capture_layers=[(0, layer)],
+        _routing_capture_layers=[(0, object())],
+        _routing_hook_storage={0: [torch.zeros(1, 72)]},
         _routing_capture_num_layers=1,
     )
 
@@ -326,28 +328,44 @@ def test_gpu_model_runner_ensure_sae_loaded_skips_routing_when_disabled(monkeypa
         sparse_encoder, "load_sae_from_env", lambda: (DummySae(), 1)
     )
 
-    layers = [
-        types.SimpleNamespace(
-            block_sparse_moe=types.SimpleNamespace(
-                capture_routing=False, _last_router_logits=None
-            )
-        )
-        for _ in range(2)
-    ]
-    dummy_self = types.SimpleNamespace(
-        _sae_enabled=True,
-        _sae=None,
-        _sae_block_tokens=512,
-        _routing_capture_layers=[],
-        _routing_capture_num_layers=0,
-        device=torch.device("cpu"),
-        model=types.SimpleNamespace(model=types.SimpleNamespace(layers=layers)),
-        model_config=types.SimpleNamespace(sae_max_layer=1, dtype=torch.float32),
-    )
+    layers = [_make_routing_layer(), _make_routing_layer()]
+    dummy_self = _make_dummy_runner(layers)
 
     gmr.GPUModelRunner._ensure_sae_loaded(dummy_self)
 
     assert isinstance(dummy_self._sae, DummySae)
     assert dummy_self._routing_capture_layers == []
     assert dummy_self._routing_capture_num_layers == 2
-    assert all(not layer.block_sparse_moe.capture_routing for layer in layers)
+    assert dummy_self._routing_hook_storage == {}
+    assert dummy_self._routing_hook_handles == []
+    assert all(len(layer.block_sparse_moe.gate._forward_hooks) == 0 for layer in layers)
+
+
+def test_gpu_model_runner_clear_routing_capture_hooks_removes_hooks(monkeypatch):
+    from vllm.sae import sparse_encoder
+    from vllm.v1.worker import gpu_model_runner as gmr
+
+    monkeypatch.setattr(gmr, "_ROUTING_CAPTURE", True)
+    monkeypatch.setattr(
+        sparse_encoder, "load_sae_from_env", lambda: (DummySae(), 1)
+    )
+
+    layers = [_make_routing_layer()]
+    dummy_self = _make_dummy_runner(layers)
+
+    gmr.GPUModelRunner._ensure_sae_loaded(dummy_self)
+    gate = layers[0].block_sparse_moe.gate
+
+    _ = gate(torch.randn(2, 4))
+    assert len(dummy_self._routing_hook_storage[0]) == 1
+    assert len(gate._forward_hooks) == 1
+
+    gmr.GPUModelRunner._clear_routing_capture_hooks(dummy_self)
+
+    assert dummy_self._routing_capture_layers == []
+    assert dummy_self._routing_hook_storage == {}
+    assert dummy_self._routing_hook_handles == []
+    assert len(gate._forward_hooks) == 0
+
+    _ = gate(torch.randn(2, 4))
+    assert dummy_self._routing_hook_storage == {}
