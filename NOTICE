@@ -1,0 +1,17 @@
+This product includes software developed at vLLM Project (https://github.com/vllm-project/vllm),
+originally released under the Apache License, Version 2.0.
+
+Modifications by Icertis Solutions:
+- SAE (Sparse Autoencoder) feature extraction via custom pooling runner
+- Expert routing capture via forward hooks on MoE gate modules
+- MoE router logits capture alongside SAE features
+- Dense payload return for SAE measurement
+- Activation histogram logging
+- Custom type support for MsgPack serialization
+- Early-exit model truncation via sae_max_layer parameter
+
+These modifications add SAE-based representation learning capabilities to the vLLM inference engine
+for contract clause classification tasks.
+
+Original source: https://github.com/vllm-project/vllm
+Fork source: https://github.com/tkellogg/vllm
